@@ -29,6 +29,9 @@ load_dotenv(".env.local")
 # ── Load FAISS index once (shared across all sessions, read-only) ─────────────
 _RAG_INDEX_DIR  = os.environ.get("RAG_INDEX_DIR", "./rag_index")
 _GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+_FACE_ID = os.environ.get("FACE_ID", "")
+_FACE_NAME = os.environ.get("FACE_NAME", "")
+
 
 logger.info("Loading FAISS index from %s …", _RAG_INDEX_DIR)
 _db = RAGSearch(index_dir=_RAG_INDEX_DIR, gemini_api_key=_GEMINI_API_KEY)
@@ -84,8 +87,6 @@ Rules:
 - Before using the tool, say "Just a sec please.", then only call the tool.
 """,
         )
-        # Store tts reference so tools and on_enter can use it.
-        # Cannot use self.tts — that's a reserved property on the base Agent class.
         self._tts_instance = tts
 
     async def on_enter(self) -> None:
@@ -93,7 +94,6 @@ Rules:
         Pre-synthesize the hold phrase here — TTS is connected to the
         session at this point, so synthesize() works correctly.
         """
-        # Pre-load hold phrase (no-op if already cached from a previous session)
         if HOLD_TEXT not in tts_cache:
             frames: List[rtc.AudioFrame] = []
             async for event in self._tts_instance.synthesize(HOLD_TEXT):
@@ -129,9 +129,6 @@ Rules:
                      associate_editor, contact, fame, general.
                      Leave blank to search everything.
         """
-        # ── Play hold phrase concurrently while FAISS searches ────────────────
-        # Pre-synthesized on first call (cache hit every subsequent call).
-        # NOT awaited — runs while the search executes in parallel.
         async def _hold_audio():
             for frame in tts_cache.get(HOLD_TEXT, []):
                 yield frame
@@ -142,7 +139,6 @@ Rules:
             add_to_chat_ctx=False,
         )
 
-        # ── FAISS vector search ───────────────────────────────────────────────
         logger.info('[RAG] query="%s" section="%s"', query, section or "all")
         results = _db.search(
             query=query,
@@ -150,7 +146,6 @@ Rules:
             section_filter=section if section else None,
         )
 
-        # Interrupt hold phrase if search finished before it ended
         if not hold_handle.interrupted and not hold_handle.done():
             hold_handle.interrupt()
 
@@ -187,7 +182,6 @@ server.setup_fnc = prewarm
 async def my_agent(ctx: JobContext):
     ctx.log_context_fields = {"room": ctx.room.name}
 
-    # Single TTS instance shared between AgentSession and Assistant
     tts = inference.TTS(model="inworld/inworld-tts-1.5-max", voice="Edward")
 
     session = AgentSession(
@@ -201,15 +195,25 @@ async def my_agent(ctx: JobContext):
 
     avatar = anam.AvatarSession(
         persona_config=anam.PersonaConfig(
-            name="Gabriel",
-            avatarId="6cc28442-cccd-42a8-b6e4-24b7210a09c5",
+            name=_FACE_NAME,
+            avatarId=_FACE_ID,
         ),
     )
 
-    await avatar.start(session, room=ctx.room)
+    # ── Start Anam avatar — fall back to audio-only if it fails ──────────────
+    avatar_ok = True
+    try:
+        await avatar.start(session, room=ctx.room)
+        logger.info("Anam avatar started successfully.")
+    except Exception as exc:
+        avatar_ok = False
+        logger.warning(
+            "Anam avatar failed to start (%s: %s) — running in audio-only mode.",
+            type(exc).__name__, exc,
+        )
 
     await session.start(
-        # agent=Assistant(tts=tts),
+        agent=Assistant(tts=tts),
         room=ctx.room,
         room_options=room_io.RoomOptions(
             audio_input=room_io.AudioInputOptions(
@@ -223,6 +227,16 @@ async def my_agent(ctx: JobContext):
     )
 
     await ctx.connect()
+
+    # Notify user if avatar failed — runs after connect so they can hear it
+    if not avatar_ok:
+        await session.generate_reply(
+            instructions=(
+                "Apologise briefly that the video avatar is unavailable right now "
+                "due to a service limit, but reassure the user that the voice "
+                "assistant is fully working and you are happy to help."
+            )
+        )
 
 
 if __name__ == "__main__":
